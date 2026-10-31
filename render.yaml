@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: jarvis-index-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        value: jarvis_hyperlink_index
+      - key: OWNER_ID
+        sync: false
+      - key: SESSION_ENCRYPTION_KEY
+        sync: false
+      - key: APP_SECRET
+        generateValue: true

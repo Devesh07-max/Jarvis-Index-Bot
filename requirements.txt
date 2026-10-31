@@ -1,0 +1,9 @@
+aiogram==3.22.0
+telethon==1.42.0
+motor==3.7.1
+cryptography==45.0.7
+python-dotenv==1.1.1
+uvicorn==0.35.0
+fastapi==0.116.1
+pytest==8.4.1
+pytest-asyncio==1.1.0
