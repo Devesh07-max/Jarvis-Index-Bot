@@ -39,12 +39,12 @@ class JobStore:
             unique=True,
         )
 
-        # One active job per user/channel.
-        # Terminal jobs must not retain active_key.
         await self.collection.create_index(
             [("active_key", ASCENDING)],
             unique=True,
-            partialFilterExpression={"active_key": {"$type": "string"}},
+            partialFilterExpression={
+                "active_key": {"$type": "string"}
+            },
         )
 
     async def enqueue(
@@ -57,9 +57,16 @@ class JobStore:
         mode,
         template="",
         chat_id=None,
+        scan_scope="full",
     ):
         user_id = int(user_id)
         channel_id = int(channel_id)
+
+        if scan_scope not in {"full", "incremental"}:
+            raise ValueError(
+                "scan_scope must be 'full' or 'incremental'"
+            )
+
         now = datetime.now(timezone.utc)
         active_key = f"{user_id}:{channel_id}"
 
@@ -71,6 +78,7 @@ class JobStore:
             "mode": mode,
             "template": template,
             "chat_id": chat_id,
+            "scan_scope": scan_scope,
             "status": "Queued",
             "active_key": active_key,
             "checkpoint_last_id": 0,
@@ -83,27 +91,24 @@ class JobStore:
 
         try:
             await self.collection.insert_one(doc)
+
         except DuplicateKeyError:
-            # Do not hide the conflict or pretend this is a normal enqueue.
             existing = await self.collection.find_one({
                 "active_key": active_key,
                 "status": {"$in": list(ACTIVE)},
             })
+
             if existing:
                 raise RuntimeError(
-                    f"Active indexing job already exists: "
-                    f"{existing.get('job_id')}"
+                    "An active indexing job already exists "
+                    f"(job ID: {existing.get('job_id')})."
                 )
+
             raise
 
         return doc
 
     async def recover_interrupted(self):
-        """
-        Recover jobs left in Scanning after a process restart.
-
-        Cancel-requested jobs are finalized instead of being requeued.
-        """
         now = datetime.now(timezone.utc)
 
         cancelled = await self.collection.update_many(
@@ -115,9 +120,14 @@ class JobStore:
                 "$set": {
                     "status": "Cancelled",
                     "updated_at": now,
-                    "failure_reason": "Cancellation completed during recovery",
+                    "failure_reason": (
+                        "Cancellation completed during recovery"
+                    ),
                 },
-                "$unset": {"active_key": "", "worker_id": ""},
+                "$unset": {
+                    "active_key": "",
+                    "worker_id": "",
+                },
             },
         )
 
@@ -131,13 +141,23 @@ class JobStore:
                     "status": "Queued",
                     "updated_at": now,
                 },
-                "$unset": {"worker_id": ""},
+                "$unset": {
+                    "worker_id": "",
+                },
             },
         )
 
-        return recovered.modified_count + cancelled.modified_count
+        return (
+            recovered.modified_count
+            + cancelled.modified_count
+        )
 
-    async def claim(self, job_id=None, user_id=None, worker_id=None):
+    async def claim(
+        self,
+        job_id=None,
+        user_id=None,
+        worker_id=None,
+    ):
         query = {
             "status": "Queued",
             "cancel_requested": {"$ne": True},
@@ -154,7 +174,9 @@ class JobStore:
                 "status": "Scanning",
                 "updated_at": datetime.now(timezone.utc),
             },
-            "$inc": {"attempts": 1},
+            "$inc": {
+                "attempts": 1,
+            },
         }
 
         if worker_id:
@@ -192,7 +214,9 @@ class JobStore:
                 "status": "Scanning",
                 "cancel_requested": {"$ne": True},
             },
-            {"$set": fields},
+            {
+                "$set": fields,
+            },
         )
 
     async def request_cancel(self, user_id, job_id):
@@ -215,14 +239,22 @@ class JobStore:
             },
         )
 
-    async def finish(self, user_id, job_id, status, **fields):
+    async def finish(
+        self,
+        user_id,
+        job_id,
+        status,
+        **fields,
+    ):
         if status not in TERMINAL:
-            raise ValueError("Invalid terminal job status")
+            raise ValueError(
+                "Invalid terminal job status"
+            )
 
-        fields.update(
-            status=status,
-            updated_at=datetime.now(timezone.utc),
-        )
+        fields.update({
+            "status": status,
+            "updated_at": datetime.now(timezone.utc),
+        })
 
         return await self.collection.update_one(
             {
