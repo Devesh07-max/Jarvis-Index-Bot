@@ -12,6 +12,7 @@ def main():
         [('🔗 Connect Telegram Account','connect')],
         [('📡 My Channels','channels'),('➕ Add Channel','add_channel')],
         [('🤖 Auto Index','quick:auto'),('📝 Manual Index','quick:manual')],
+        [('🔁 Source-to-Target Index','st_home')],
         [('📂 My Indexing Jobs','jobs')],
         [('👤 My Account','account'),('❓ Help','help')],
     ])

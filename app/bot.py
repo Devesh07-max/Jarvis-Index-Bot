@@ -22,12 +22,13 @@ from .indexer import render_automatic_index, small_caps
 from .jobs import JobStore
 from .publishing import approval_signature, confirmation_matches, claim_publish, mark_chunk_inflight, clear_chunk_inflight, record_chunk, commit_published, mark_publish_failure, recover_interrupted_publishes
 from .web import start_http_server, stop_http_server
+from .source_target import parse_tme_message_url, source_links, match_messages, render_linked_index
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log=logging.getLogger("jarvis")
 
 class Flow(StatesGroup):
-    phone=State(); otp=State(); twofa=State(); channel=State(); template=State(); resolve_link=State(); resolve_forward=State(); grant=State()
+    phone=State(); otp=State(); twofa=State(); channel=State(); template=State(); resolve_link=State(); resolve_forward=State(); grant=State(); source_pair=State(); source_edit=State()
 
 
 class DesignTextMiddleware:
@@ -496,6 +497,143 @@ async def run():
         await db.previews.delete_many({"user_id":c.from_user.id,"channel_id":cid})
         await c.message.edit_text("Channel removed. Active scans and unpublished previews for this channel were cancelled.",reply_markup=K.main()); await c.answer()
 
+    async def show_source_target_pairs(target, uid, page=0):
+        total=await db.source_target_pairs.count_documents({"user_id":uid}); pages=max(1,(total+7)//8); page=max(0,min(int(page),pages-1))
+        pairs=await db.source_target_pairs.find({"user_id":uid}).sort("name",1).skip(page*8).limit(8).to_list(8)
+        buttons=[[(f"🔁 {p['name'][:48]}",f"st_pair:{p['pair_id']}")] for p in pairs]
+        nav=[]
+        if page>0: nav.append(("⬅️ Previous",f"st_page:{page-1}"))
+        if page+1<pages: nav.append(("Next ➡️",f"st_page:{page+1}"))
+        if nav: buttons.append(nav)
+        buttons.append([("➕ Add New Channel Pair","st_add")]); buttons.append([("⬅️ Main Menu","home")])
+        await target.edit_text(f"<b>Source-to-Target Index</b>\nSaved pairs · Page {page+1}/{pages} · {total} total\nChoose a pair or add a new one.",reply_markup=K.kb(buttons))
+
+    @dp.callback_query(F.data == "st_home")
+    async def source_target_home(c:CallbackQuery):
+        if not await require_premium(c.from_user.id): return await c.answer("Premium access required.",show_alert=True)
+        await show_source_target_pairs(c.message,c.from_user.id,0); await c.answer()
+
+    @dp.callback_query(F.data.startswith("st_page:"))
+    async def source_target_page(c:CallbackQuery):
+        await show_source_target_pairs(c.message,c.from_user.id,int(c.data.split(':',1)[1])); await c.answer()
+
+    @dp.callback_query(F.data == "st_add")
+    async def source_target_add(c:CallbackQuery,state:FSMContext):
+        if not await require_premium(c.from_user.id): return await c.answer("Premium access required.",show_alert=True)
+        await state.clear(); await state.set_state(Flow.source_pair)
+        await c.message.answer(
+            "<b>Add a saved channel pair</b>\nSend these 9 lines in order:\n"
+            "1. Pair name (e.g. Parmar railway → Parmar backup)\n"
+            "2. Source channel ID or @username\n3. Target channel ID or @username\n"
+            "4. Source first file message link\n5. Source last file message link\n6. Source index message link\n"
+            "7. Target first file message link\n8. Target last file message link\n9. Target index message link (send - if not available).\n\n"
+            "Both channels must already be registered and accessible through your connected Telegram account. The target must also be registered for publishing.",
+            reply_markup=K.kb([[('❌ Cancel','cancel_flow')]]))
+        await c.answer()
+
+    @dp.message(Flow.source_pair)
+    async def source_target_save_pair(m:Message,state:FSMContext):
+        if not await require_premium(m.from_user.id): await state.clear(); return await m.answer("Premium access required.")
+        lines=[x.strip() for x in (m.text or '').splitlines() if x.strip()]
+        if len(lines)!=9:
+            return await m.answer("Please send exactly 9 non-empty lines as instructed. No pair was saved.")
+        try:
+            name,src_ref,dst_ref,src_first,src_last,src_index,dst_first,dst_last,dst_index=lines
+            src_entity=await tg.resolve_channel(m.from_user.id,src_ref); dst_entity=await tg.resolve_channel(m.from_user.id,dst_ref)
+            src_id=tg.marked_channel_id(src_entity); dst_id=tg.marked_channel_id(dst_entity)
+            if not await db.registered_channels.find_one({"user_id":m.from_user.id,"channel_id":src_id}):
+                return await m.answer("Source channel is accessible but not registered. Register it first using Add Channel.")
+            target=await db.registered_channels.find_one({"user_id":m.from_user.id,"channel_id":dst_id})
+            if not target: return await m.answer("Target channel must be registered first so the bot can publish there.")
+            def link_id(value, expected_channel):
+                parsed=parse_tme_message_url(value)
+                if not parsed or int(parsed[0])!=int(expected_channel): raise ValueError("A message link does not belong to its selected channel.")
+                return int(parsed[1])
+            sf=link_id(src_first,src_id); sl=link_id(src_last,src_id); si=link_id(src_index,src_id)
+            tf=link_id(dst_first,dst_id); tl=link_id(dst_last,dst_id)
+            ti=None if dst_index=='-' else link_id(dst_index,dst_id)
+            if sf>sl or tf>tl: raise ValueError("First file link must precede the last file link.")
+            # Verify all boundary and index messages are readable by this Telegram account.
+            for cid,mid in ((src_id,sf),(src_id,sl),(src_id,si),(dst_id,tf),(dst_id,tl)):
+                await tg.get_message(m.from_user.id,cid,mid)
+            if ti: await tg.get_message(m.from_user.id,dst_id,ti)
+            pair_id=uuid.uuid4().hex[:12]; now=datetime.now(timezone.utc)
+            doc={"user_id":m.from_user.id,"pair_id":pair_id,"name":name[:80],"source_channel_id":src_id,"source_title":src_entity.title,
+                 "target_channel_id":dst_id,"target_title":dst_entity.title,"source_first_id":sf,"source_last_id":sl,"source_index_id":si,
+                 "target_first_id":tf,"target_last_id":tl,"target_index_id":ti,"created_at":now,"updated_at":now}
+            update_pair_id=(await state.get_data()).get("update_pair_id")
+            if update_pair_id:
+                await db.source_target_pairs.update_one({"user_id":m.from_user.id,"pair_id":update_pair_id},{"$set":{k:v for k,v in doc.items() if k not in {"pair_id","user_id","created_at"}}})
+                pair_id=update_pair_id
+            else:
+                await db.source_target_pairs.insert_one(doc)
+            await state.clear()
+            await m.answer(f"<b>Channel pair saved successfully!</b>\n{name}\nSource: {html.escape(src_entity.title)}\nTarget: {html.escape(dst_entity.title)}",reply_markup=K.kb([[('🔁 Open Saved Pair',f'st_pair:{pair_id}')],[('📂 All Saved Pairs','st_home')]]))
+        except Exception as exc:
+            await m.answer(f"Could not save this pair: {html.escape(str(exc)[:250])}\nPlease check the channel references and message links. No pair was saved.")
+
+    @dp.callback_query(F.data.startswith("st_pair:"))
+    async def source_target_pair(c:CallbackQuery):
+        pair_id=c.data.split(':',1)[1]; p=await db.source_target_pairs.find_one({"user_id":c.from_user.id,"pair_id":pair_id})
+        if not p: return await c.answer("Saved pair not found.",show_alert=True)
+        await c.message.edit_text(f"<b>{html.escape(p['name'])}</b>\nSource: {html.escape(p['source_title'])}\nTarget: {html.escape(p['target_title'])}\n\nChoose whether to update saved links/settings or create hyperlinks using the current settings.",reply_markup=K.kb([[('🔄 Update Existing Links / Settings',f'st_update:{pair_id}')],[('🔗 Create Hyperlinks',f'st_create:{pair_id}')],[('🗑 Delete Pair',f'st_delete:{pair_id}')],[('⬅️ Back to Saved Pairs','st_home')]])); await c.answer()
+
+    @dp.callback_query(F.data.startswith("st_update:"))
+    async def source_target_update(c:CallbackQuery,state:FSMContext):
+        pair_id=c.data.split(':',1)[1]; p=await db.source_target_pairs.find_one({"user_id":c.from_user.id,"pair_id":pair_id})
+        if not p: return await c.answer("Pair not found.",show_alert=True)
+        await state.clear(); await state.set_state(Flow.source_pair); await state.update_data(update_pair_id=pair_id)
+        await c.message.answer("Send the same 9 lines again with updated information. Keep the same pair name if desired. The existing pair will be updated, not duplicated.",reply_markup=K.kb([[('❌ Cancel','cancel_flow')]])); await c.answer()
+
+    @dp.callback_query(F.data.startswith("st_delete:"))
+    async def source_target_delete(c:CallbackQuery):
+        pair_id=c.data.split(':',1)[1]
+        result=await db.source_target_pairs.delete_one({"user_id":c.from_user.id,"pair_id":pair_id})
+        await c.message.edit_text("Saved channel pair deleted. Telegram channels and messages were not changed.",reply_markup=K.kb([[('📂 Saved Pairs','st_home')],[('🏠 Main Menu','home')]])); await c.answer()
+
+    @dp.callback_query(F.data.startswith("st_create:"))
+    async def source_target_create(c:CallbackQuery):
+        if not await require_premium(c.from_user.id): return await c.answer("Premium access required.",show_alert=True)
+        pair_id=c.data.split(':',1)[1]; p=await db.source_target_pairs.find_one({"user_id":c.from_user.id,"pair_id":pair_id})
+        if not p: return await c.answer("Saved pair not found.",show_alert=True)
+        try:
+            src_range=await tg.get_message_range(c.from_user.id,p['source_channel_id'],p['source_first_id'],p['source_last_id'])
+            dst_range=await tg.get_message_range(c.from_user.id,p['target_channel_id'],p['target_first_id'],p['target_last_id'])
+            source_index=await tg.get_message(c.from_user.id,p['source_channel_id'],p['source_index_id'])
+            links=source_links(source_index)
+            if not links: return await c.answer("No clickable Telegram message links were found in the source index.",show_alert=True)
+            source_ids=[]
+            for _,_,url in links:
+                parsed=parse_tme_message_url(url)
+                if parsed and int(parsed[0])==int(p['source_channel_id']): source_ids.append(int(parsed[1]))
+            src_by_id={int(x.id):x for x in src_range}
+            if any(mid not in src_by_id for mid in source_ids):
+                return await c.answer("One or more source index links point outside the saved source file range. Update the pair boundaries.",show_alert=True)
+            mapping,warnings=match_messages(src_range,dst_range)
+            target_channel=await db.registered_channels.find_one({"user_id":c.from_user.id,"channel_id":p['target_channel_id']})
+            rendered,linked,missing=render_linked_index(source_index,mapping,p['target_channel_id'],target_channel.get('username'))
+            if linked==0: return await c.answer("No source hyperlinks could be mapped to target files.",show_alert=True)
+            # Create a normal preview/job so the existing preview, approval and safe publisher are reused.
+            jid=uuid.uuid4().hex[:12]; now=datetime.now(timezone.utc)
+            entry_rows=[]
+            for start,end,url in links:
+                parsed=parse_tme_message_url(url); sid=int(parsed[1]) if parsed else 0
+                label=(source_index.message or '')[start:end]
+                entry_rows.append({"label":label,"key":label,"message_id":mapping.get(sid),"resolved":sid in mapping})
+            missing_labels=[x['label'] for x in entry_rows if not x.get('message_id')]
+            warning_text=''
+            if warnings: warning_text='\n\n<b>Matching notes</b>\n'+'\n'.join('• '+html.escape(x) for x in warnings[:12])
+            if missing_labels: rendered += '\n\n<b>Unmatched source index links</b>\n'+'\n'.join('• '+html.escape(x) for x in missing_labels)
+            rendered += warning_text
+            await db.indexing_jobs.insert_one({"user_id":c.from_user.id,"job_id":jid,"channel_id":p['target_channel_id'],"channel_title":p['target_title'],"mode":"source_target","template":"","status":"Preview Ready","created_at":now,"updated_at":now,"messages_scanned":len(src_range)+len(dst_range),"categories_found":len(entry_rows),"unresolved":len(missing_labels),"source_target_pair_id":pair_id})
+            await db.previews.insert_one({"user_id":c.from_user.id,"job_id":jid,"channel_id":p['target_channel_id'],"channel_title":p['target_title'],"channel_username":target_channel.get('username'),"mode":"source_target","html":rendered,"entries":entry_rows,"missing":missing_labels,"uncertain_captions":warnings,"total_scanned":len(src_range)+len(dst_range),"created_at":now,"expires_at":now+timedelta(days=7),"approved":False,"empty":not bool(entry_rows),"source_target_pair_id":pair_id})
+            await db.source_target_pairs.update_one({"user_id":c.from_user.id,"pair_id":pair_id},{"$set":{"last_used_at":now,"updated_at":now}})
+            await c.message.answer(f"<b>Source-to-Target matching complete</b>\nSource files: {len(src_range)}\nTarget files: {len(dst_range)}\nIndex links: {len(links)}\nMapped links: {linked}\nUnmatched: {len(missing_labels)}\nMatching/review notes: {len(warnings)}\n\nReview the preview and correct any unmatched entries before publishing.",reply_markup=K.kb([[('👁 View Index Preview',f'preview:{jid}')],[('✏️ Correct / Edit Links',f'st_edit_menu:{jid}')],[('📂 Saved Channel Pairs','st_home')]]))
+            await c.answer("Preview created.")
+        except Exception as exc:
+            log.warning("Source-target generation failed: %s",type(exc).__name__)
+            await c.answer(f"Could not create preview: {str(exc)[:180]}",show_alert=True)
+
     @dp.callback_query(F.data.startswith("quick:"))
     async def quick_mode(c:CallbackQuery,state:FSMContext):
         mode=c.data.split(":",1)[1]
@@ -721,6 +859,57 @@ async def run():
         await db.previews.delete_one({"user_id":c.from_user.id,"job_id":jid})
         await c.message.edit_text("Indexing job cancelled. No index was published.",reply_markup=K.main()); await c.answer()
 
+    @dp.callback_query(F.data.startswith('st_edit:'))
+    async def source_target_edit_entry(c:CallbackQuery,state:FSMContext):
+        parts=c.data.split(':')
+        if len(parts)!=3: return await c.answer("Invalid edit request.",show_alert=True)
+        jid,index=parts[1],int(parts[2]); p=await db.previews.find_one({"user_id":c.from_user.id,"job_id":jid})
+        if not p or p.get('mode')!='source_target' or index<0 or index>=len(p.get('entries',[])):
+            return await c.answer("Index entry not found.",show_alert=True)
+        entry=p['entries'][index]
+        await state.clear(); await state.set_state(Flow.source_edit)
+        await state.update_data(source_edit_job=jid,source_edit_index=index)
+        await c.message.answer(f"Send the correct target-channel Telegram message link for:\n<b>{html.escape(entry['label'])}</b>",reply_markup=K.kb([[('❌ Cancel','cancel_flow')]])); await c.answer()
+
+    @dp.message(Flow.source_edit)
+    async def source_target_edit_receive(m:Message,state:FSMContext):
+        data=await state.get_data(); jid=data.get('source_edit_job'); idx=int(data.get('source_edit_index',-1))
+        p=await db.previews.find_one({"user_id":m.from_user.id,"job_id":jid}) if jid else None
+        if not p or idx<0 or idx>=len(p.get('entries',[])):
+            await state.clear(); return await m.answer("This edit request expired. Reopen the preview.")
+        parsed=parse_tme_message_url(m.text or '')
+        if not parsed or int(parsed[0])!=int(p['channel_id']):
+            return await m.answer("That link is not from this target channel. Send a valid target-channel message link.")
+        mid=int(parsed[1])
+        if not await tg.validate_message(m.from_user.id,p['channel_id'],mid):
+            return await m.answer("The target message could not be verified. Check the link and try again.")
+        entries=p.get('entries',[]); label=entries[idx]['label']; entries[idx]['message_id']=mid; entries[idx]['resolved']=True
+        missing=[x['label'] for x in entries if not x.get('message_id')]
+        # Replace the hyperlink destination for this visible label, preserving source index text/layout.
+        target=await db.registered_channels.find_one({"user_id":m.from_user.id,"channel_id":p['channel_id']}) or {}
+        dest=(f"https://t.me/{target['username']}/{mid}" if target.get('username') else f"https://t.me/c/{str(p['channel_id']).removeprefix('-100')}/{mid}")
+        body=p.get('html',''); escaped_label=html.escape(label)
+        pattern=r'<a href="[^"]+">'+re.escape(escaped_label)+r'</a>'
+        replacement=f'<a href="{html.escape(dest,quote=True)}">{escaped_label}</a>'
+        body2=re.sub(pattern,lambda _:replacement,body,count=1)
+        if body2==body:
+            body2=body.replace(escaped_label,replacement,1)
+        await db.previews.update_one({"user_id":m.from_user.id,"job_id":jid},{"$set":{"entries":entries,"missing":missing,"html":body2,"empty":not bool(entries)}})
+        await db.indexing_jobs.update_one({"user_id":m.from_user.id,"job_id":jid},{"$set":{"unresolved":len(missing),"status":"Preview Ready" if entries else "Waiting for Resolution"},"$unset":{"approval_token":"","approval_expires_at":""}})
+        await state.clear()
+        await m.answer("Target link updated and saved. It will remain unchanged during this preview.",reply_markup=K.kb([[('👁 Back to Preview',f'preview:{jid}')],[('🔧 Edit Another Link',f'st_edit_menu:{jid}')]]))
+
+    @dp.callback_query(F.data.startswith('st_edit_menu:'))
+    async def source_target_edit_menu(c:CallbackQuery):
+        jid=c.data.split(':',1)[1]; p=await db.previews.find_one({"user_id":c.from_user.id,"job_id":jid})
+        if not p or p.get('mode')!='source_target': return await c.answer("Preview not found.",show_alert=True)
+        buttons=[]
+        for i,e in enumerate(p.get('entries',[])[:40]):
+            status='✓' if e.get('message_id') else '⚠'
+            buttons.append([(f"{status} {e.get('label','Entry')[:42]}",f"st_edit:{jid}:{i}")])
+        buttons.append([('⬅️ Back to Preview',f'preview:{jid}')])
+        await c.message.answer("Select an index hyperlink to change its target:",reply_markup=K.kb(buttons)); await c.answer()
+
     @dp.callback_query(F.data.startswith('preview:'))
     async def preview(c:CallbackQuery):
         jid=c.data.split(':',1)[1]; p=await db.previews.find_one({"user_id":c.from_user.id,"job_id":jid}); job=await owned_job(c.from_user.id,jid)
@@ -734,7 +923,8 @@ async def run():
         if job.get("status") in {"Preview Ready", "Waiting for Resolution"} and not p.get("empty") and p.get("entries"):
             label = '⚠️ Publish Available Links' if p.get("missing") else '✅ Approve & Publish'
             buttons.append([(label,f'approve:{jid}')])
-        if p.get("missing"): buttons.append([('🔧 Resolve Missing Links',f'resolve:{jid}')])
+        if p.get("missing") and p.get('mode')!='source_target': buttons.append([('🔧 Resolve Missing Links',f'resolve:{jid}')])
+        if p.get('mode')=='source_target': buttons.append([('✏️ Correct / Edit Links',f'st_edit_menu:{jid}')])
         if job.get("status") not in {"Published","Publish Review Required"}: buttons.append([('🔄 Regenerate',f'regenerate:{jid}')])
         if job.get("status") in {"Preview Ready","Waiting for Resolution","Queued","Scanning"}: buttons.append([('❌ Cancel',f'cancel_job:{jid}')])
         await c.message.answer("Review the preview. Publishing requires a second confirmation.",reply_markup=K.kb(buttons) if buttons else K.main()); await c.answer()
@@ -1017,7 +1207,8 @@ async def run():
         if session:
             try: connected_label="Yes" if await tg.client_for(uid) else "Invalid/revoked"
             except Exception: connected_label="Unable to verify"
-        await c.message.edit_text(f"<b>My Account</b>\nTelegram user ID: <code>{uid}</code>\nPremium: {'Active' if await require_premium(uid) else 'Inactive'}\nPremium expiry: {sub.get('expires_at') if sub else 'N/A'}\nConnected account: {connected_label}\nRegistered channels: {cc}\nIndexing jobs: {jc}",reply_markup=K.kb([[('🔗 Connect Telegram Account','connect')],[('📡 My Channels','channels')],[('📂 My Indexing Jobs','jobs')],[('🏠 Main Menu','home')]])); await c.answer()
+        await c.message.edit_text(f"<b>My Account</b>\nTelegram user ID: <code>{uid}</code>\nPremium: {'Active' if await require_premium(uid) else 'Inactive'}\nPremium expiry: {sub.get('expires_at') if sub else 'N/A'}\nConnected account: {connected_label}\nRegistered channels: {cc}\nIndexing jobs: {jc}",reply_markup=K.kb([[('🔗 Connect Telegram Account','connect')],[('📡 My Channels','channels')],[('🔁 Source-to-Target Index','st_home')],
+        [('📂 My Indexing Jobs','jobs')],[('🏠 Main Menu','home')]])); await c.answer()
     @dp.callback_query(F.data=="help")
     async def help(c:CallbackQuery):
         await c.message.edit_text("<b>How to use JARVIS Index Bot</b>\n1. Connect Telegram account.\n2. Register a Telegram channel.\n3. Add this bot as channel administrator with posting permission.\n4. Select Create Index.\n5. Choose Manual Template Mode or Automatic Topic Mode.\n6. Wait for scanning.\n7. Resolve missing links.\n8. Review preview.\n9. Approve publishing.",reply_markup=K.kb([[('🔗 Connect Account','connect')],[('➕ Add Channel','add_channel')],[('📋 Create Index','create')],[('🏠 Main Menu','home')]])); await c.answer()

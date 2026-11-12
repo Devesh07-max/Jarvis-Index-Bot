@@ -38,6 +38,8 @@ class Database:
         await self.db.login_attempts.create_index([("user_id", ASCENDING)], unique=True)
         await self.db.login_attempts.create_index([("expires_at", ASCENDING)], expireAfterSeconds=0)
         await self.db.publish_holds.create_index([("user_id", ASCENDING), ("channel_id", ASCENDING)], unique=True)
+        await self.db.source_target_pairs.create_index([("user_id", ASCENDING), ("pair_id", ASCENDING)], unique=True)
+        await self.db.source_target_pairs.create_index([("user_id", ASCENDING), ("name", ASCENDING)])
 
     async def user_page(self, collection_name: str, user_id: int, page: int = 0, page_size: int = 8, sort_field: str = "created_at", descending: bool = True):
         """Database-side pagination; never loads an entire user's collection."""

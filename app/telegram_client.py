@@ -283,6 +283,29 @@ class UserTelegram:
         if progress:
             await progress(count, last_id)
 
+    async def get_message(self, user_id: int, channel_id: int, message_id: int):
+        client = await self.client_for(user_id)
+        if not client:
+            raise RuntimeError("Telegram account is disconnected")
+        entity = await client.get_entity(int(channel_id))
+        msg = await client.get_messages(entity, ids=int(message_id))
+        if not msg or type(msg).__name__ == "MessageEmpty" or getattr(msg, "empty", False):
+            raise ValueError("Message not found or inaccessible")
+        return msg
+
+    async def get_message_range(self, user_id: int, channel_id: int, first_id: int, last_id: int):
+        client = await self.client_for(user_id)
+        if not client:
+            raise RuntimeError("Telegram account is disconnected")
+        if int(first_id) > int(last_id):
+            raise ValueError("First message ID must be before last message ID")
+        entity = await client.get_entity(int(channel_id))
+        rows=[]
+        async for msg in client.iter_messages(entity, min_id=int(first_id)-1, max_id=int(last_id)+1, reverse=True):
+            if getattr(msg, "media", None) or getattr(msg, "message", None):
+                rows.append(msg)
+        return rows
+
     async def scan(self, user_id: int, channel_id: int, progress=None, min_id=0):
         messages = []
         async for record in self.iter_channel_messages(user_id, channel_id, min_id=min_id, progress=progress):

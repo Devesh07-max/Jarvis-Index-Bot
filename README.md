@@ -117,3 +117,39 @@ The v3 local suite contains 47 passing tests. It covers core index matching/grou
 - The polling worker is intended to run as one replica. A separate distributed worker/queue service would be required for horizontal scaling.
 - OTP/2FA pending clients are in memory. After a Render restart, the user must restart Telegram account connection; durable FSM state does not persist authentication secrets.
 - Telegram forwards that hide their origin cannot be verified and are rejected.
+
+## Source-to-Target Index Mode (new)
+
+The bot now includes a saved-pair workflow for recreating an existing source-channel index with links pointing to the corresponding files in your own target channel.
+
+### Requirements
+- Connect your Telegram account using the existing Telethon login. The source channel may belong to someone else; your logged-in account only needs permission to read its messages and index links.
+- Register both source and target channels using **Add Channel**. The target channel must also be configured for Bot API publishing (add this bot as an administrator with post permission).
+- Source and target file ranges should contain the same files in the same order. Minor caption differences such as a source website URL being removed and your own attribution being added are expected.
+
+### Save a channel pair
+Open **Source-to-Target Index → Add New Channel Pair** and send nine non-empty lines:
+
+1. Pair name, e.g. `Parmar railway → Parmar backup`
+2. Source channel ID or `@username`
+3. Target channel ID or `@username`
+4. Source first file message link
+5. Source last file message link
+6. Source index message link
+7. Target first file message link
+8. Target last file message link
+9. Target index message link, or `-` if there is no target index yet
+
+The bot validates that the message links belong to the selected channels and are readable by the connected account. Saved pairs are per-user, unlimited, paginated, and can be updated or deleted without changing Telegram messages.
+
+### Create and review
+Select a saved pair and press **Create Hyperlinks**. The bot reads the source index's Telegram hyperlink entities, follows the source file links, scans the saved source/target message ranges, and maps source messages to target messages by their ordered position. Caption normalization ignores URLs and common trailing attribution. If range sizes differ, or captions differ, the preview shows matching notes; entries outside the target range remain unlinked.
+
+The generated preview is stored in the normal preview/job collections and uses the existing safe publishing confirmation flow. Use **Correct / Edit Links** to select any index entry and submit a verified target-channel message link. Corrections update the saved preview and invalidate any prior publish approval. Review the final preview before publishing.
+
+### Matching limitation
+This mode is designed for the user's stated same-order/same-files workflow. It currently uses ordered position as the primary mapping after validating source hyperlinks against the source range; it does not attempt to infer a different file order. If the source and target sequences differ, update the ranges or correct the preview links manually. The optional target index link is stored for pair reference but is not modified automatically.
+
+### Source-to-Target matching when channel order differs
+
+Source-to-Target mode does **not** require source and target files to be in the same order. It compares normalized captions and Telegram document filenames, ignores website URLs and common trailing uploader attribution, and creates one-to-one source/target matches. Relative position is only a small tie-breaker when content evidence is similar; it is never used as an unconditional positional mapping. Unmatched, low-confidence, and duplicate-caption matches are flagged in the preview for manual correction. If a channel contains many identical captions and filenames, the bot cannot reliably distinguish those duplicates without additional identifying information, so those cases must be reviewed before publishing.

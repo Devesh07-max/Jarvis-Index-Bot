@@ -26,3 +26,12 @@ Document extraction is metadata-only as requested. The bot reads captions, Teleg
 `python -m pytest -q` — 64 tests passed in the patch workspace.
 
 Live Telegram, MongoDB Atlas, and Render behavior still needs deployment-side verification.
+
+## Source-to-Target mode update
+- Added per-user saved channel-pair records in the dedicated `jarvis_hyperlink_index` database.
+- Added paginated Saved Pairs UI, Add/Update/Delete pair actions, and one-tap Create Hyperlinks.
+- Added Telethon message range retrieval and source-index hyperlink extraction.
+- Added ordered source-to-target mapping with URL/attribution normalization and preview warnings.
+- Reuses existing preview, approval, and safe Bot API publishing flow.
+- Added per-entry verified target-link correction and persisted preview edits.
+- Added focused tests for Telegram message-link parsing, caption normalization, ordered mapping, and destination rewriting.
