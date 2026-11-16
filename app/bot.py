@@ -22,7 +22,7 @@ from .indexer import render_automatic_index, small_caps
 from .jobs import JobStore
 from .publishing import approval_signature, confirmation_matches, claim_publish, mark_chunk_inflight, clear_chunk_inflight, record_chunk, commit_published, mark_publish_failure, recover_interrupted_publishes
 from .web import start_http_server, stop_http_server
-from .source_target import parse_tme_message_url, source_links, match_messages, render_linked_index
+from .source_target import parse_tme_message_url, source_links, match_messages, render_linked_index, normalize_index_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log=logging.getLogger("jarvis")
@@ -247,7 +247,79 @@ async def run():
     @dp.message(Command("admin"))
     async def admin(m:Message):
         if m.from_user.id!=cfg.owner_id: return await m.answer("Not authorized.")
-        await m.answer("Admin commands:\n/grant USER_ID DAYS\n/revoke USER_ID\n/premium USER_ID\n/premium_list [PAGE]\n/publish_review\n/clear_publish_hold USER_ID CHANNEL_ID")
+        await m.answer(
+            "<b>JARVIS Admin Panel</b>\nManage premium access and publishing safety.",
+            reply_markup=K.kb([
+                [("➕ Grant Premium","admin_grant"),("➖ Revoke Premium","admin_revoke")],
+                [("📋 Premium Users","admin_premium_list")],
+                [("🛡 Publishing Review","admin_publish_review")],
+                [("🏠 Main Menu","home")],
+            ]))
+
+    @dp.callback_query(F.data=="admin_grant")
+    async def admin_grant_start(c:CallbackQuery,state:FSMContext):
+        if c.from_user.id!=cfg.owner_id: return await c.answer("Not authorized.",show_alert=True)
+        await state.clear(); await state.set_state(Flow.grant)
+        await c.message.answer("Send the user's Telegram ID and premium duration in days, separated by a space.\nExample: <code>123456789 30</code>")
+        await c.answer()
+
+    @dp.message(Flow.grant)
+    async def admin_grant_receive(m:Message,state:FSMContext):
+        if m.from_user.id!=cfg.owner_id: await state.clear(); return await m.answer("Not authorized.")
+        try:
+            parts=(m.text or "").split()
+            action=(await state.get_data()).get("admin_action","grant")
+            if len(parts)!=(1 if action=="revoke" else 2): raise ValueError()
+            uid=int(parts[0])
+            if uid<=0: raise ValueError()
+            if action=="revoke":
+                if len(parts)!=1: raise ValueError()
+                await premium.revoke(uid)
+                await state.clear()
+                return await m.answer(f"✅ Premium revoked for <code>{uid}</code>",
+                    reply_markup=K.kb([[("➕ Grant Premium","admin_grant")],[("🏠 Admin Panel","admin_home")]]))
+            if len(parts)!=2: raise ValueError()
+            days=int(parts[1])
+            if days<1 or days>3650: raise ValueError()
+            expiry=await premium.grant(uid,days)
+            await state.clear()
+            await m.answer(f"✅ Premium activated for <code>{uid}</code>\nDuration: {days} days\nExpires: <code>{expiry.isoformat()}</code>",
+                reply_markup=K.kb([[("➕ Grant Another","admin_grant")],[("📋 Premium Users","admin_premium_list")],[("🏠 Admin Panel","admin_home")]]))
+        except Exception:
+            await m.answer("Invalid details. Send exactly: <code>USER_ID DAYS</code> (e.g. <code>123456789 30</code>).")
+
+    @dp.callback_query(F.data=="admin_home")
+    async def admin_home(c:CallbackQuery):
+        if c.from_user.id!=cfg.owner_id: return await c.answer("Not authorized.",show_alert=True)
+        await c.message.answer("<b>JARVIS Admin Panel</b>",reply_markup=K.kb([
+            [("➕ Grant Premium","admin_grant"),("➖ Revoke Premium","admin_revoke")],
+            [("📋 Premium Users","admin_premium_list")],
+            [("🛡 Publishing Review","admin_publish_review")],
+        ])); await c.answer()
+
+    @dp.callback_query(F.data=="admin_revoke")
+    async def admin_revoke_start(c:CallbackQuery,state:FSMContext):
+        if c.from_user.id!=cfg.owner_id: return await c.answer("Not authorized.",show_alert=True)
+        await state.clear(); await state.set_state(Flow.grant)
+        await state.update_data(admin_action="revoke")
+        await c.message.answer("Send the Telegram user ID whose premium access should be revoked.")
+        await c.answer()
+
+    @dp.callback_query(F.data=="admin_premium_list")
+    async def admin_premium_list_button(c:CallbackQuery):
+        if c.from_user.id!=cfg.owner_id: return await c.answer("Not authorized.",show_alert=True)
+        await show_premium_page(c.message,0); await c.answer()
+
+    @dp.callback_query(F.data=="admin_publish_review")
+    async def admin_publish_review_button(c:CallbackQuery):
+        if c.from_user.id!=cfg.owner_id: return await c.answer("Not authorized.",show_alert=True)
+        rows=await db.indexing_jobs.find({"$or":[{"status":"Publish Review Required"},{"partial_message_ids":{"$exists":True,"$ne":[]}}]}).sort("updated_at",-1).limit(50).to_list(50)
+        if not rows: return await c.answer("No publishing reviews are pending.",show_alert=True)
+        lines=["<b>Publishing reviews required</b>"]
+        for row in rows:
+            ids=row.get("published_message_ids") or row.get("partial_message_ids") or [x.get("message_id") for x in row.get("publish_chunks",[]) if x.get("message_id")]
+            lines.append(f"User <code>{row['user_id']}</code> · {html.escape(row.get('channel_title',''))} · Job <code>{row['job_id']}</code> · IDs <code>{ids}</code>")
+        await c.message.answer("\\n".join(lines)[:3900]); await c.answer()
     @dp.message(Command("grant"))
     async def grant(m:Message):
         if m.from_user.id!=cfg.owner_id: return
@@ -526,8 +598,8 @@ async def run():
             "1. Pair name (e.g. Parmar railway → Parmar backup)\n"
             "2. Source channel ID or @username\n3. Target channel ID or @username\n"
             "4. Source first file message link\n5. Source last file message link\n6. Source index message link\n"
-            "7. Target first file message link\n8. Target last file message link\n9. Target index message link (send - if not available).\n\n"
-            "Both channels must already be registered and accessible through your connected Telegram account. The target must also be registered for publishing.",
+            "7. Target first file message link\n8. Target last file message link\n9. Existing target index message link (required).\n\n"
+            "Your connected Telegram account must be able to read the source channel and edit the existing target index message (own message or channel admin with Edit Messages permission). The bot itself does not need to be an admin in the source or target channel for this mode. Channels will be added to My Channels automatically.",
             reply_markup=K.kb([[('❌ Cancel','cancel_flow')]]))
         await c.answer()
 
@@ -541,13 +613,31 @@ async def run():
             name,src_ref,dst_ref,src_first,src_last,src_index,dst_first,dst_last,dst_index=lines
             src_entity=await tg.resolve_channel(m.from_user.id,src_ref); dst_entity=await tg.resolve_channel(m.from_user.id,dst_ref)
             src_id=tg.marked_channel_id(src_entity); dst_id=tg.marked_channel_id(dst_entity)
-            if not await db.registered_channels.find_one({"user_id":m.from_user.id,"channel_id":src_id}):
-                return await m.answer("Source channel is accessible but not registered. Register it first using Add Channel.")
+            # Resolve and validate both channels directly from this flow. No separate
+            # Add Channel round-trip is required for Source-to-Target mode.
+            if not await tg.can_access_channel(m.from_user.id,src_id):
+                raise ValueError("Connected Telegram account cannot read the source channel.")
+            if not await tg.can_access_channel(m.from_user.id,dst_id):
+                raise ValueError("Connected Telegram account cannot access the target channel.")
+            if dst_index == '-':
+                raise ValueError("An existing target index message link is required. Paste the copied topic list in the target channel first, then send its message link here.")
+            now_registered=datetime.now(timezone.utc)
+            for entity,cid in ((src_entity,src_id),(dst_entity,dst_id)):
+                await db.registered_channels.update_one(
+                    {"user_id":m.from_user.id,"channel_id":cid},
+                    {"$set":{"user_id":m.from_user.id,"channel_id":cid,
+                             "title":entity.title,"username":getattr(entity,"username",None),
+                             "registered_at":now_registered,"source_target_auto_added":True}},
+                    upsert=True)
             target=await db.registered_channels.find_one({"user_id":m.from_user.id,"channel_id":dst_id})
-            if not target: return await m.answer("Target channel must be registered first so the bot can publish there.")
             def link_id(value, expected_channel):
                 parsed=parse_tme_message_url(value)
-                if not parsed or int(parsed[0])!=int(expected_channel): raise ValueError("A message link does not belong to its selected channel.")
+                if not parsed:
+                    raise ValueError("Invalid Telegram message link.")
+                # Public t.me/username/message links parse to a username; the
+                # selected channel is independently verified by get_message below.
+                if isinstance(parsed[0], int) and int(parsed[0]) != int(expected_channel):
+                    raise ValueError("A message link does not belong to its selected channel.")
                 return int(parsed[1])
             sf=link_id(src_first,src_id); sl=link_id(src_last,src_id); si=link_id(src_index,src_id)
             tf=link_id(dst_first,dst_id); tl=link_id(dst_last,dst_id)
@@ -556,7 +646,13 @@ async def run():
             # Verify all boundary and index messages are readable by this Telegram account.
             for cid,mid in ((src_id,sf),(src_id,sl),(src_id,si),(dst_id,tf),(dst_id,tl)):
                 await tg.get_message(m.from_user.id,cid,mid)
-            if ti: await tg.get_message(m.from_user.id,dst_id,ti)
+            if ti:
+                target_index_message=await tg.get_message(m.from_user.id,dst_id,ti)
+                source_index_message=await tg.get_message(m.from_user.id,src_id,si)
+                if normalize_index_text(getattr(source_index_message,"message", "")) != normalize_index_text(getattr(target_index_message,"message", "")):
+                    raise ValueError("Source and target index text do not match. Copy the same topic list to the target channel without changing its wording/order, then save the pair again.")
+                if not await tg.can_edit_channel_message(m.from_user.id,dst_id,ti):
+                    raise ValueError("Your connected Telegram account cannot edit this target index message. Make the account the message author or give it Edit Messages admin permission in the target channel.")
             pair_id=uuid.uuid4().hex[:12]; now=datetime.now(timezone.utc)
             doc={"user_id":m.from_user.id,"pair_id":pair_id,"name":name[:80],"source_channel_id":src_id,"source_title":src_entity.title,
                  "target_channel_id":dst_id,"target_title":dst_entity.title,"source_first_id":sf,"source_last_id":sl,"source_index_id":si,
@@ -596,43 +692,72 @@ async def run():
         if not await require_premium(c.from_user.id): return await c.answer("Premium access required.",show_alert=True)
         pair_id=c.data.split(':',1)[1]; p=await db.source_target_pairs.find_one({"user_id":c.from_user.id,"pair_id":pair_id})
         if not p: return await c.answer("Saved pair not found.",show_alert=True)
+        await c.answer("Source-to-Target indexing started.")
+        async def update_stage(stage, detail=""):
+            try:
+                await c.message.edit_text(
+                    f"<b>🔁 Source-to-Target Indexing</b>\nCurrent step: {html.escape(stage)}"
+                    + (f"\n{html.escape(detail)}" if detail else ""),
+                    reply_markup=K.kb([[("⬅️ Saved Pairs","st_home")]]))
+            except Exception as edit_exc:
+                if "message is not modified" not in str(edit_exc).lower():
+                    log.debug("Source-target progress update skipped: %s",type(edit_exc).__name__)
         try:
-            src_range=await tg.get_message_range(c.from_user.id,p['source_channel_id'],p['source_first_id'],p['source_last_id'])
-            dst_range=await tg.get_message_range(c.from_user.id,p['target_channel_id'],p['target_first_id'],p['target_last_id'])
+            await update_stage("Reading source index and its clickable topic links…")
             source_index=await tg.get_message(c.from_user.id,p['source_channel_id'],p['source_index_id'])
+            target_index=await tg.get_message(c.from_user.id,p['target_channel_id'],p['target_index_id'])
+            if normalize_index_text(getattr(source_index,"message", "")) != normalize_index_text(getattr(target_index,"message", "")):
+                await c.message.answer("The source and target index text no longer match. No changes were made. Make the target index text identical to the source index and retry.")
+                return
             links=source_links(source_index)
-            if not links: return await c.answer("No clickable Telegram message links were found in the source index.",show_alert=True)
-            source_ids=[]
-            for _,_,url in links:
+            if not links:
+                await c.message.answer("No clickable Telegram message links were found in the source index. Check that the topic rows really have Telegram message hyperlinks.")
+                return
+            await update_stage("Reading target file range…",f"Source index links found: {len(links)}")
+            async def target_range_progress(scanned,last_id):
+                await update_stage("Scanning target channel messages…",f"Target messages checked: {scanned} · Latest message ID: {last_id}")
+            dst_range=await tg.get_message_range(c.from_user.id,p['target_channel_id'],p['target_first_id'],p['target_last_id'],progress=target_range_progress)
+            source_messages=[]; source_ids=[]; source_first=int(p['source_first_id']); source_last=int(p['source_last_id'])
+            for link_no,(_,_,url) in enumerate(links,1):
                 parsed=parse_tme_message_url(url)
-                if parsed and int(parsed[0])==int(p['source_channel_id']): source_ids.append(int(parsed[1]))
-            src_by_id={int(x.id):x for x in src_range}
-            if any(mid not in src_by_id for mid in source_ids):
-                return await c.answer("One or more source index links point outside the saved source file range. Update the pair boundaries.",show_alert=True)
-            mapping,warnings=match_messages(src_range,dst_range)
-            target_channel=await db.registered_channels.find_one({"user_id":c.from_user.id,"channel_id":p['target_channel_id']})
+                if not parsed:
+                    continue
+                source_id=int(parsed[1])
+                if source_id < source_first or source_id > source_last:
+                    await c.message.answer(f"Source index link #{link_no} points outside the saved source file range (message {source_id}). Update the source first/last file links.")
+                    return
+                if source_id in source_ids:
+                    continue
+                linked_message=await tg.get_message(c.from_user.id,p['source_channel_id'],source_id)
+                source_messages.append(linked_message); source_ids.append(source_id)
+                if link_no==1 or link_no%5==0 or link_no==len(links):
+                    await update_stage("Following source index hyperlinks and reading file captions…",f"Opened {link_no}/{len(links)} links · Target files loaded: {len(dst_range)}")
+            if not source_messages:
+                await c.message.answer("Could not open any source file links using your connected Telegram account.")
+                return
+            await update_stage("Matching each linked source file to target files…",f"Linked source files: {len(source_messages)} · Target files: {len(dst_range)}")
+            mapping,warnings=match_messages(source_messages,dst_range)
+            target_channel=await db.registered_channels.find_one({"user_id":c.from_user.id,"channel_id":p['target_channel_id']}) or {}
             rendered,linked,missing=render_linked_index(source_index,mapping,p['target_channel_id'],target_channel.get('username'))
-            if linked==0: return await c.answer("No source hyperlinks could be mapped to target files.",show_alert=True)
+            if linked==0:
+                await c.message.answer("No source hyperlinks could be mapped to target files. Check channel ranges and matching captions.")
+                return
+            await update_stage("Building review preview…",f"Mapped links: {linked} · Unmatched: {len(missing)}")
             # Create a normal preview/job so the existing preview, approval and safe publisher are reused.
             jid=uuid.uuid4().hex[:12]; now=datetime.now(timezone.utc)
             entry_rows=[]
             for start,end,url in links:
                 parsed=parse_tme_message_url(url); sid=int(parsed[1]) if parsed else 0
                 label=(source_index.message or '')[start:end]
-                entry_rows.append({"label":label,"key":label,"message_id":mapping.get(sid),"resolved":sid in mapping})
+                entry_rows.append({"label":label,"key":label,"source_message_id":sid,"message_id":mapping.get(sid),"resolved":sid in mapping})
             missing_labels=[x['label'] for x in entry_rows if not x.get('message_id')]
-            warning_text=''
-            if warnings: warning_text='\n\n<b>Matching notes</b>\n'+'\n'.join('• '+html.escape(x) for x in warnings[:12])
-            if missing_labels: rendered += '\n\n<b>Unmatched source index links</b>\n'+'\n'.join('• '+html.escape(x) for x in missing_labels)
-            rendered += warning_text
-            await db.indexing_jobs.insert_one({"user_id":c.from_user.id,"job_id":jid,"channel_id":p['target_channel_id'],"channel_title":p['target_title'],"mode":"source_target","template":"","status":"Preview Ready","created_at":now,"updated_at":now,"messages_scanned":len(src_range)+len(dst_range),"categories_found":len(entry_rows),"unresolved":len(missing_labels),"source_target_pair_id":pair_id})
-            await db.previews.insert_one({"user_id":c.from_user.id,"job_id":jid,"channel_id":p['target_channel_id'],"channel_title":p['target_title'],"channel_username":target_channel.get('username'),"mode":"source_target","html":rendered,"entries":entry_rows,"missing":missing_labels,"uncertain_captions":warnings,"total_scanned":len(src_range)+len(dst_range),"created_at":now,"expires_at":now+timedelta(days=7),"approved":False,"empty":not bool(entry_rows),"source_target_pair_id":pair_id})
+            await db.indexing_jobs.insert_one({"user_id":c.from_user.id,"job_id":jid,"channel_id":p['target_channel_id'],"channel_title":p['target_title'],"mode":"source_target","template":"","status":"Preview Ready","created_at":now,"updated_at":now,"messages_scanned":len(source_messages)+len(dst_range),"categories_found":len(entry_rows),"unresolved":len(missing_labels),"source_target_pair_id":pair_id})
+            await db.previews.insert_one({"user_id":c.from_user.id,"job_id":jid,"channel_id":p['target_channel_id'],"channel_title":p['target_title'],"channel_username":target_channel.get('username'),"mode":"source_target","html":rendered,"entries":entry_rows,"missing":missing_labels,"uncertain_captions":warnings,"target_index_id":p['target_index_id'],"total_scanned":len(source_messages)+len(dst_range),"created_at":now,"expires_at":now+timedelta(days=7),"approved":False,"empty":not bool(entry_rows),"source_target_pair_id":pair_id})
             await db.source_target_pairs.update_one({"user_id":c.from_user.id,"pair_id":pair_id},{"$set":{"last_used_at":now,"updated_at":now}})
-            await c.message.answer(f"<b>Source-to-Target matching complete</b>\nSource files: {len(src_range)}\nTarget files: {len(dst_range)}\nIndex links: {len(links)}\nMapped links: {linked}\nUnmatched: {len(missing_labels)}\nMatching/review notes: {len(warnings)}\n\nReview the preview and correct any unmatched entries before publishing.",reply_markup=K.kb([[('👁 View Index Preview',f'preview:{jid}')],[('✏️ Correct / Edit Links',f'st_edit_menu:{jid}')],[('📂 Saved Channel Pairs','st_home')]]))
-            await c.answer("Preview created.")
+            await c.message.answer(f"<b>✅ Source-to-Target matching complete</b>\nSource files opened from index links: {len(source_messages)}\nTarget files: {len(dst_range)}\nIndex links: {len(links)}\nMapped links: {linked}\nUnmatched: {len(missing_labels)}\nMatching/review notes: {len(warnings)}\n\nReview the preview and correct any unmatched entries before publishing.",reply_markup=K.kb([[('👁 View Index Preview',f'preview:{jid}')],[('✏️ Correct / Edit Links',f'st_edit_menu:{jid}')],[('📂 Saved Channel Pairs','st_home')]]))
         except Exception as exc:
-            log.warning("Source-target generation failed: %s",type(exc).__name__)
-            await c.answer(f"Could not create preview: {str(exc)[:180]}",show_alert=True)
+            log.exception("Source-target generation failed for user=%s pair=%s",c.from_user.id,pair_id)
+            await c.message.answer(f"❌ Could not create preview.\nReason: <code>{html.escape(type(exc).__name__)}</code>\nDetails: {redact_error(exc)[:500]}")
 
     @dp.callback_query(F.data.startswith("quick:"))
     async def quick_mode(c:CallbackQuery,state:FSMContext):
@@ -729,9 +854,15 @@ async def run():
                 show_alert=True,
             )
         await state.clear()
-        await c.message.edit_text("Scanning started. This may take a while for large channels…")
+        # Acknowledge the Telegram callback before launching work so the client
+        # never leaves the Start Indexing button spinning until the scan ends.
+        await c.answer("Indexing job queued.")
+        await c.message.edit_text(
+            f"<b>🚀 Indexing started</b>\nChannel: {html.escape(title)}\n"
+            f"Mode: {html.escape(mode.title())}\nScope: {html.escape(scope.title())}\n"
+            "Status: Preparing Telegram connection…\nProgress: 0%",
+            reply_markup=K.kb([[("❌ Cancel Scan",f"cancel_scan:{jid}")]]))
         spawn_background(do_scan(c.message,uid,cid,title,mode,template_text,jid))
-        await c.answer()
 
     async def create_job(uid,cid,title,mode,template,chat_id=None,scan_scope="full"):
         if not await require_premium(uid): raise PermissionError("Premium access required")
@@ -756,6 +887,19 @@ async def run():
             return await message.answer("This indexing job is no longer queued or was cancelled.")
         checkpoint=int(job.get("checkpoint_last_id",0)); base_scanned=int(job.get("messages_scanned",0)); scanned=base_scanned
         try:
+            async def show_stage(stage, detail="", percent=None):
+                suffix=f"\nProgress: {percent}%" if percent is not None else ""
+                body=(f"<b>⚙️ Indexing in progress</b>\n📡 Channel: {html.escape(title)}"
+                      f"\n⚙️ Mode: {html.escape(mode.title())}\n🔄 Current step: {html.escape(stage)}")
+                if detail: body += f"\n{html.escape(detail)}"
+                body += suffix
+                try:
+                    await message.edit_text(body,reply_markup=K.kb([[("❌ Cancel Scan",f"cancel_scan:{job_id}")]]))
+                except Exception as edit_exc:
+                    # Telegram may reject an identical edit; that must not stop indexing.
+                    if "message is not modified" not in str(edit_exc).lower():
+                        log.debug("Progress message update skipped: %s",type(edit_exc).__name__)
+            await show_stage("Connecting to Telegram and preparing scanner", "The scan will update here as messages are processed.", 0)
             builder=StreamingIndexBuilder(mode,template_text).restore(job.get("builder_state"))
             if checkpoint == 0 and job.get("scan_scope") == "incremental" and not job.get("builder_state"):
                 saved=await db.channel_scan_state.find_one({"user_id":uid,"channel_id":int(cid)})
@@ -763,8 +907,9 @@ async def run():
                     checkpoint=int(saved.get("last_message_id",0) or 0)
                     base_scanned=int(saved.get("messages_scanned",0) or 0)
                     builder.restore(saved["builder_state"])
+            last_progress_update=0
             async def progress(batch_count,last_id):
-                nonlocal scanned
+                nonlocal scanned,last_progress_update
                 current=await db.indexing_jobs.find_one({"user_id":uid,"job_id":job_id})
                 if not current or current.get('status')=='Cancelled' or current.get('cancel_requested'):
                     raise RuntimeError("Scan cancelled by user")
@@ -772,12 +917,11 @@ async def run():
                     raise PermissionError("Premium entitlement expired during scan")
                 scanned=base_scanned+batch_count
                 await job_store.checkpoint(uid,job_id,last_id,scanned,builder_state=builder.snapshot())
-                try:
+                if batch_count-last_progress_update>=25 or batch_count<=1:
+                    last_progress_update=batch_count
                     found,_,_=builder.result()
-                    await message.edit_text(f"<b>{small_caps('Scanning Progress')}</b>\n📡 Channel: {html.escape(small_caps(title))}\n⚙️ Mode: {small_caps(mode)}\n📨 Messages scanned: {scanned:,}\n📚 Categories detected: {len(found)}\n⚠️ Unresolved: {sum(1 for e in found if not e.message_id)}",
-                        reply_markup=K.kb([[('❌ Cancel Scan',f'cancel_scan:{job_id}')]]))
-                except Exception:
-                    pass
+                    await show_stage("Reading channel messages",
+                        f"Messages scanned: {scanned:,}\nLast message ID: {last_id}\nCategories detected so far: {len(found)}")
             async for record in tg.iter_channel_messages(uid,cid,min_id=checkpoint,progress=progress):
                 builder.add(record)
             current=await owned_job(uid,job_id)
@@ -785,6 +929,7 @@ async def run():
                 raise RuntimeError("Scan cancelled by user")
             if not await require_premium(uid):
                 raise PermissionError("Premium entitlement expired during scan")
+            await show_stage("Matching captions and building index", "Applying saved manual resolutions and checking message links…", 94)
             entries,groups,uncertain=builder.result()
             # Apply only saved resolutions that still point to an accessible message in this channel.
             resolutions={}
@@ -806,6 +951,7 @@ async def run():
                          "last_message_id":max(checkpoint,int(current.get("checkpoint_last_id",0) or 0)),
                          "messages_scanned":scanned,"builder_state":builder.snapshot(),
                          "completed_at":datetime.now(timezone.utc)}},upsert=True)
+            await show_stage("Rendering preview", "Formatting clickable Telegram links and preparing review…", 97)
             if mode=='manual':
                 rendered,missing=render_manual_template(template_text,entries,cid,channel.get("username"))
             else:
@@ -827,6 +973,11 @@ async def run():
             if not result.modified_count:
                 await db.previews.delete_one({"user_id":uid,"job_id":job_id})
                 return await message.answer("Scan was cancelled before preview creation. No index was published.")
+            try:
+                await message.edit_text(f"<b>✅ Indexing completed</b>\nMessages scanned: {scanned:,}\nCategories found: {len(entries)}\nUnresolved: {len(missing)}",
+                    reply_markup=K.kb([[('👁 View Index Preview',f'preview:{job_id}')],[('📂 My Indexing Jobs','jobs')]]))
+            except Exception:
+                pass
             await message.answer(f"<b>{small_caps('Scan Results')}</b>\n📡 Channel: {html.escape(small_caps(title))}\n📨 Messages scanned: {scanned:,}\n📚 Categories found: {len(entries)}\n⚠️ Unresolved: {len(missing)}\n🔎 Items needing review: {len(uncertain)}",
                 reply_markup=K.kb([[('👁 View Index Preview',f'preview:{job_id}')],[('🔧 Resolve Missing Links',f'resolve:{job_id}')],[('🔄 Regenerate Index',f'regenerate:{job_id}')],[('❌ Cancel',f'cancel_job:{job_id}')]]))
         except Exception as e:
@@ -837,7 +988,10 @@ async def run():
             if current and current.get('status')=='Cancelled':
                 await message.answer("Scan cancelled. No index was published.")
             else:
-                await message.answer("Scanning failed. Check Telegram account access, channel permissions, premium status, and logs; no index was published.")
+                await message.answer(
+                    f"❌ Indexing failed.\nReason: <code>{html.escape(type(e).__name__)}</code>\n"
+                    f"Details: {redact_error(e)[:700]}\nNo index was published. Check the connected Telegram account and channel access.",
+                    reply_markup=K.main())
 
     @dp.callback_query(F.data.startswith('cancel_scan:'))
     async def cancel_scan(c:CallbackQuery):
@@ -885,15 +1039,26 @@ async def run():
             return await m.answer("The target message could not be verified. Check the link and try again.")
         entries=p.get('entries',[]); label=entries[idx]['label']; entries[idx]['message_id']=mid; entries[idx]['resolved']=True
         missing=[x['label'] for x in entries if not x.get('message_id')]
-        # Replace the hyperlink destination for this visible label, preserving source index text/layout.
+        # Replace this exact occurrence; duplicate visible labels are not conflated.
         target=await db.registered_channels.find_one({"user_id":m.from_user.id,"channel_id":p['channel_id']}) or {}
         dest=(f"https://t.me/{target['username']}/{mid}" if target.get('username') else f"https://t.me/c/{str(p['channel_id']).removeprefix('-100')}/{mid}")
         body=p.get('html',''); escaped_label=html.escape(label)
-        pattern=r'<a href="[^"]+">'+re.escape(escaped_label)+r'</a>'
+        pattern=re.compile(r'<a href="[^"]+">'+re.escape(escaped_label)+r'</a>')
+        occurrence=sum(1 for item in entries[:idx] if item.get('label')==label)
+        matches=list(pattern.finditer(body))
         replacement=f'<a href="{html.escape(dest,quote=True)}">{escaped_label}</a>'
-        body2=re.sub(pattern,lambda _:replacement,body,count=1)
-        if body2==body:
-            body2=body.replace(escaped_label,replacement,1)
+        if occurrence < len(matches):
+            match=matches[occurrence]
+            body2=body[:match.start()]+replacement+body[match.end():]
+        else:
+            # Unmatched rows are deliberately plain text in the preview; manual
+            # correction must turn that exact row back into a target hyperlink.
+            plain_matches=list(re.finditer(re.escape(escaped_label),body))
+            if occurrence < len(plain_matches):
+                match=plain_matches[occurrence]
+                body2=body[:match.start()]+replacement+body[match.end():]
+            else:
+                body2=body
         await db.previews.update_one({"user_id":m.from_user.id,"job_id":jid},{"$set":{"entries":entries,"missing":missing,"html":body2,"empty":not bool(entries)}})
         await db.indexing_jobs.update_one({"user_id":m.from_user.id,"job_id":jid},{"$set":{"unresolved":len(missing),"status":"Preview Ready" if entries else "Waiting for Resolution"},"$unset":{"approval_token":"","approval_expires_at":""}})
         await state.clear()
@@ -919,6 +1084,14 @@ async def run():
         body=p['html']
         for chunk in split_html(body,3900):
             await c.message.answer(chunk,disable_web_page_preview=True)
+        if p.get("mode") == "source_target":
+            review_notes=[]
+            if p.get("missing"):
+                review_notes.append("Unmatched index rows: " + ", ".join(p.get("missing",[])[:15]))
+            if p.get("uncertain_captions"):
+                review_notes.extend(p.get("uncertain_captions",[])[:10])
+            if review_notes:
+                await c.message.answer("<b>Matching notes — review before updating:</b>\n" + "\n".join("• " + html.escape(x) for x in review_notes))
         buttons=[]
         if job.get("status") in {"Preview Ready", "Waiting for Resolution"} and not p.get("empty") and p.get("entries"):
             label = '⚠️ Publish Available Links' if p.get("missing") else '✅ Approve & Publish'
@@ -1061,29 +1234,39 @@ async def run():
         if not p or not job or preview_expired(p): return await c.answer("Preview expired or unavailable.",show_alert=True)
         if not await require_premium(c.from_user.id): return await c.answer("Premium is not active.",show_alert=True)
         if job.get("status") not in {"Preview Ready", "Waiting for Resolution"} or p.get("empty") or not p.get("entries"): return await c.answer("Only a non-empty ready preview can be published.",show_alert=True)
-        await c.message.answer("<b>Choose publishing destination</b>\\nYour links will still point to the original channel messages.",
-            reply_markup=K.kb([[("📢 Publish in Source Channel · Default",f"approve_dest:{jid}:channel")],
-                               [("📩 Send to My Private Chat",f"approve_dest:{jid}:private")],
-                               [("⬅️ Back to Preview",f"preview:{jid}")]]))
+        if p.get("mode") == "source_target":
+            if not p.get("target_index_id"):
+                return await c.answer("Existing target index message is missing. Recreate the pair with its target index link.",show_alert=True)
+            await c.message.answer(
+                "<b>Update Existing Target Index</b>\nThe bot will edit the target index message you selected. It will not create a duplicate index post.",
+                reply_markup=K.kb([[ ("✏️ Update Existing Target Index",f"approve_dest:{jid}:target_index")],
+                                   [("⬅️ Back to Preview",f"preview:{jid}")]]))
+        else:
+            await c.message.answer("<b>Choose publishing destination</b>\nYour links will still point to the original channel messages.",
+                reply_markup=K.kb([[ ("📢 Publish in Source Channel · Default",f"approve_dest:{jid}:channel")],
+                                   [("📩 Send to My Private Chat",f"approve_dest:{jid}:private")],
+                                   [("⬅️ Back to Preview",f"preview:{jid}")]]))
         await c.answer()
 
     @dp.callback_query(F.data.startswith('approve_dest:'))
     async def approve_destination(c:CallbackQuery):
         parts=c.data.split(':')
-        if len(parts)!=3 or parts[2] not in {"channel","private"}: return await c.answer("Invalid destination.",show_alert=True)
+        if len(parts)!=3 or parts[2] not in {"channel","private","target_index"}: return await c.answer("Invalid destination.",show_alert=True)
         _,jid,destination=parts
         p=await db.previews.find_one({"user_id":c.from_user.id,"job_id":jid})
         job=await owned_job(c.from_user.id,jid)
         if not p or not job or preview_expired(p) or job.get("status") not in {"Preview Ready", "Waiting for Resolution"}: return await c.answer("Preview unavailable.",show_alert=True)
         if not await require_premium(c.from_user.id): return await c.answer("Premium is not active.",show_alert=True)
         if p.get("empty") or not p.get("entries"): return await c.answer("An empty index cannot be published.",show_alert=True)
+        if destination == "target_index" and (p.get("mode") != "source_target" or not p.get("target_index_id")):
+            return await c.answer("Existing target index is not configured for this preview.",show_alert=True)
         ch=await db.registered_channels.find_one({"user_id":c.from_user.id,"channel_id":p["channel_id"]})
         if not ch: return await c.answer("Channel registration missing.",show_alert=True)
         nonce=secrets.token_urlsafe(9); expires_at=datetime.now(timezone.utc)+timedelta(minutes=10)
         await db.indexing_jobs.update_one({"user_id":c.from_user.id,"job_id":jid,"status":{"$in":["Preview Ready","Waiting for Resolution"]}},
             {"$set":{"approval_token":nonce,"approval_expires_at":expires_at,"approval_destination":destination}})
         sig=approval_signature(cfg.app_secret,c.from_user.id,jid,nonce)
-        target="the source channel" if destination=="channel" else "your private chat"
+        target=("the existing target index message" if destination=="target_index" else "the source channel" if destination=="channel" else "your private chat")
         warning=f"\\n\\n⚠️ {len(p.get('missing',[]))} unresolved row(s) will remain unlinked." if p.get("missing") else ""
         await c.message.answer(f"<b>Confirm Publishing</b>\\nPublish this index to <b>{target}</b>?{warning}\\nConfirmation expires in 10 minutes.",
             reply_markup=K.kb([[("🚀 Yes, Publish Index",f"publish:{jid}:{destination}:{sig}")],[("❌ Cancel","home")]]))
@@ -1094,7 +1277,7 @@ async def run():
         parts=c.data.split(':')
         if len(parts)!=4: return await c.answer("Invalid or expired confirmation.",show_alert=True)
         _,jid,destination,sig=parts
-        if destination not in {"channel","private"}: return await c.answer("Invalid destination.",show_alert=True)
+        if destination not in {"channel","private","target_index"}: return await c.answer("Invalid destination.",show_alert=True)
         p=await db.previews.find_one({"user_id":c.from_user.id,"job_id":jid}); job=await owned_job(c.from_user.id,jid)
         now=datetime.now(timezone.utc)
         if not p or not job or job.get("status") not in {"Preview Ready", "Waiting for Resolution"} or int(p.get("channel_id",0))!=int(job.get("channel_id",-1)): return await c.answer("Preview unavailable or already processed.",show_alert=True)
@@ -1107,19 +1290,20 @@ async def run():
         if p.get("empty") or not p.get("entries") or not (p.get("html") or "").strip(): return await c.answer("Preview validation failed; an empty index cannot be published.",show_alert=True)
         ch=await db.registered_channels.find_one({"user_id":c.from_user.id,"channel_id":p["channel_id"]})
         if not ch: return await c.answer("Channel registration missing.",show_alert=True)
-        if destination=="channel":
-            if ch.get("publish_hold") or await db.publish_holds.find_one({"user_id":c.from_user.id,"channel_id":p["channel_id"]}):
+        if destination in {"channel", "target_index"}:
+            if destination == "channel" and (ch.get("publish_hold") or await db.publish_holds.find_one({"user_id":c.from_user.id,"channel_id":p["channel_id"]})):
                 return await c.answer("Publishing is paused for this channel because a previous partial publish needs owner review.",show_alert=True)
             try: channel_access=await tg.can_access_channel(c.from_user.id,p["channel_id"])
             except Exception: return await c.answer("Could not verify connected Telegram account access. Try again.",show_alert=True)
             if not channel_access: return await c.answer("The connected Telegram account can no longer access this channel.",show_alert=True)
-            try:
-                member=await bot.get_chat_member(p['channel_id'],bot_me.id)
-                if member.status not in ('administrator','creator') or (member.status=='administrator' and not getattr(member,'can_post_messages',False)):
-                    return await c.answer("Publishing bot must be a channel admin with post permission.",show_alert=True)
-            except Exception:
-                return await c.answer("Could not verify publishing permissions. Check bot channel access.",show_alert=True)
-        else:
+            if destination == "channel":
+                try:
+                    member=await bot.get_chat_member(p['channel_id'],bot_me.id)
+                    if member.status not in ('administrator','creator') or (member.status=='administrator' and not getattr(member,'can_post_messages',False)):
+                        return await c.answer("Publishing bot must be a channel admin with post permission.",show_alert=True)
+                except Exception:
+                    return await c.answer("Could not verify publishing permissions. Check bot channel access.",show_alert=True)
+        elif destination == "private":
             try: await bot.send_chat_action(c.from_user.id,"typing")
             except Exception: return await c.answer("Open the bot's private chat and press Start before private publishing.",show_alert=True)
         claimed=await claim_publish(db.indexing_jobs,c.from_user.id,jid,nonce,now)
@@ -1127,8 +1311,24 @@ async def run():
         try: await c.answer("Publishing started.")
         except Exception: pass
         sent_messages=[]; publish_committed=False
-        target_chat_id=int(p["channel_id"]) if destination=="channel" else int(c.from_user.id)
+        target_chat_id=int(p["channel_id"]) if destination in {"channel", "target_index"} else int(c.from_user.id)
         try:
+            if destination == "target_index":
+                target_index_id=int(p.get("target_index_id") or 0)
+                if not target_index_id:
+                    raise ValueError("target_index_id_missing")
+                if len(p["html"]) > 12000:
+                    raise ValueError("index_html_too_large_for_single_target_message")
+                edited=await tg.edit_channel_message(c.from_user.id,p["channel_id"],target_index_id,p["html"])
+                if not edited:
+                    raise RuntimeError("target_index_edit_failed")
+                committed=await commit_published(db.indexing_jobs,c.from_user.id,jid,[target_index_id],datetime.now(timezone.utc))
+                if not committed:
+                    raise RuntimeError("publish_state_commit_failed")
+                publish_committed=True
+                target_link=(f"https://t.me/{ch['username']}/{target_index_id}" if ch.get('username') else f"https://t.me/c/{str(p['channel_id']).removeprefix('-100')}/{target_index_id}")
+                await c.message.answer(f"<b>Existing Target Index Updated Successfully!</b>\nChannel: {html.escape(ch['title'])}\nUpdated message: <a href=\"{target_link}\">Open updated index</a>",reply_markup=K.main())
+                return
             chunks=split_html(p["html"],3900)
             for index,chunk in enumerate(chunks):
                 # A crash after send but before the next DB write is treated as unknown,

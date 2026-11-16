@@ -243,7 +243,22 @@ class UserTelegram:
             ref=int(f"-100{ref}")
         elif isinstance(ref,str) and ref.lstrip("-").isdigit():
             ref=int(ref)
-        entity = await client.get_entity(ref)
+        try:
+            entity = await client.get_entity(ref)
+        except Exception as original_error:
+            # A raw numeric channel ID may not yet be present in Telethon's
+            # entity cache. The connected account's dialogs are authoritative
+            # for channels it can actually access, so resolve it there.
+            if isinstance(ref, int) and ref < 0:
+                entity = None
+                async for dialog in client.iter_dialogs():
+                    if dialog.is_channel and self.marked_channel_id(dialog.entity) == ref:
+                        entity = dialog.entity
+                        break
+                if entity is None:
+                    raise original_error
+            else:
+                raise
         if not isinstance(entity, Channel):
             raise ValueError("The reference is not a Telegram channel")
         return entity
@@ -271,7 +286,7 @@ class UserTelegram:
                                 break
                     if msg.message or media or filename:
                         yield MessageRecord(msg.id, msg.message or "", msg.date, filename, mime_type)
-                    if progress and count % 100 == 0:
+                    if progress and (count <= 1 or count % 25 == 0):
                         await progress(count, last_id)
                 break
             except FloodWaitError as exc:
@@ -293,17 +308,57 @@ class UserTelegram:
             raise ValueError("Message not found or inaccessible")
         return msg
 
-    async def get_message_range(self, user_id: int, channel_id: int, first_id: int, last_id: int):
+    async def can_edit_channel_message(self, user_id: int, channel_id: int, message_id: int) -> bool:
+        """Check whether the connected account can edit the selected message."""
+        client = await self.client_for(user_id)
+        if not client:
+            raise RuntimeError("Telegram account is disconnected")
+        entity = await self.resolve_channel(user_id, str(int(channel_id)))
+        message = await client.get_messages(entity, ids=int(message_id))
+        if not message or type(message).__name__ == "MessageEmpty" or getattr(message, "empty", False):
+            return False
+        if int(getattr(message, "sender_id", 0) or 0) == int(user_id):
+            return True
+        permissions = await client.get_permissions(entity, "me")
+        if getattr(permissions, "is_creator", False):
+            return True
+        rights = getattr(permissions, "admin_rights", None)
+        return bool(getattr(rights, "edit_messages", False))
+
+    async def edit_channel_message(self, user_id: int, channel_id: int, message_id: int, html_text: str):
+        """Edit an existing channel message through the connected user account.
+
+        The logged-in account must own the message or have Telegram's edit-message
+        administrator right in the target channel. The bot token is not used here.
+        """
+        client = await self.client_for(user_id)
+        if not client:
+            raise RuntimeError("Telegram account is disconnected")
+        entity = await self.resolve_channel(user_id, str(int(channel_id)))
+        current = await client.get_messages(entity, ids=int(message_id))
+        if not current or type(current).__name__ == "MessageEmpty" or getattr(current, "empty", False):
+            raise ValueError("The saved target index message was not found or is inaccessible")
+        return await client.edit_message(
+            entity, int(message_id), html_text,
+            parse_mode="html", link_preview=False,
+        )
+
+    async def get_message_range(self, user_id: int, channel_id: int, first_id: int, last_id: int, progress=None):
         client = await self.client_for(user_id)
         if not client:
             raise RuntimeError("Telegram account is disconnected")
         if int(first_id) > int(last_id):
             raise ValueError("First message ID must be before last message ID")
         entity = await client.get_entity(int(channel_id))
-        rows=[]
+        rows=[]; scanned=0; last_seen=int(first_id)-1
         async for msg in client.iter_messages(entity, min_id=int(first_id)-1, max_id=int(last_id)+1, reverse=True):
+            scanned+=1; last_seen=int(msg.id)
             if getattr(msg, "media", None) or getattr(msg, "message", None):
                 rows.append(msg)
+            if progress and (scanned==1 or scanned%25==0):
+                await progress(scanned,last_seen)
+        if progress:
+            await progress(scanned,last_seen)
         return rows
 
     async def scan(self, user_id: int, channel_id: int, progress=None, min_id=0):

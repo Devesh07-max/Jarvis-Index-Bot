@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from app.source_target import parse_tme_message_url, clean_caption, match_ordered_messages, source_links, render_linked_index
+from app.source_target import parse_tme_message_url, clean_caption, match_ordered_messages, source_links, render_linked_index, normalize_index_text, target_message_url
 
 
 def test_parse_private_and_public_message_links():
@@ -60,3 +60,41 @@ def test_unrelated_target_is_not_paired_by_position():
     mapping,warnings=match_ordered_messages(src,dst)
     assert mapping == {}
     assert any('No reliable target' in w for w in warnings)
+
+
+def test_target_index_text_comparison_ignores_only_whitespace():
+    assert normalize_index_text("📋 Index\n\nMath → Lectures") == normalize_index_text("📋 Index  Math → Lectures")
+    assert normalize_index_text("Math → Lectures") != normalize_index_text("Math → Notes")
+
+
+def test_target_message_url_uses_private_channel_format_or_username():
+    assert target_message_url(-100456, 90) == "https://t.me/c/456/90"
+    assert target_message_url(-100456, 90, "my_target") == "https://t.me/my_target/90"
+
+
+def test_unmatched_source_index_link_is_rendered_as_plain_text():
+    text = "Lecture 01"
+    Entity = type('MessageEntityTextUrl', (), {})
+    entity = Entity(); entity.offset = 0; entity.length = len(text); entity.url = 'https://t.me/c/123/10'
+    msg = SimpleNamespace(message=text, entities=[entity])
+    rendered, linked, missing = render_linked_index(msg, {}, -100456)
+    assert '<a href=' not in rendered
+    assert 'Lecture 01' in rendered
+    assert linked == 0 and missing == 1
+
+
+def test_filename_evidence_breaks_duplicate_generic_caption_ties():
+    DocumentAttributeFilename = type("DocumentAttributeFilename", (), {})
+    class Document:
+        def __init__(self, name):
+            item = DocumentAttributeFilename(); item.file_name = name
+            self.attributes = [item]
+    class Media:
+        def __init__(self, name): self.document = Document(name)
+    src = [SimpleNamespace(id=10, message="Lecture", media=Media("percentage.pdf"))]
+    dst = [
+        SimpleNamespace(id=90, message="Lecture", media=Media("profit-loss.pdf")),
+        SimpleNamespace(id=91, message="Lecture", media=Media("percentage.pdf")),
+    ]
+    mapping, warnings = match_ordered_messages(src, dst)
+    assert mapping == {10: 91}

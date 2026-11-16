@@ -5,7 +5,7 @@ then maps the linked source messages to the target channel's ordered file range.
 Caption comparison ignores website URLs and trailing owner signatures.
 """
 from __future__ import annotations
-import html, re, unicodedata
+import html, re, unicodedata, copy
 from urllib.parse import urlparse
 
 
@@ -51,25 +51,76 @@ def source_links(message):
     return sorted(found)
 
 
+def target_message_url(target_channel_id: int, target_message_id: int, target_username: str|None=None) -> str:
+    if target_username:
+        return f'https://t.me/{target_username}/{int(target_message_id)}'
+    return f'https://t.me/c/{str(target_channel_id).removeprefix("-100")}/{int(target_message_id)}'
+
+
 def render_linked_index(message, source_to_target: dict[int,int], target_channel_id: int, target_username: str|None=None):
+    """Rewrite TextUrl entities while preserving the source index's formatting.
+
+    Telethon's HTML unparser preserves bold/italic/underline/spoiler/code entities,
+    unlike rebuilding the message from plain text. The visible index text remains
+    exactly as authored in the source channel.
+    """
     text=getattr(message,'message','') or ''
-    entities=source_links(message)
-    out=[]; cursor=0; linked=0; missing=0
-    for start,end,url in entities:
+    rewritten=copy.deepcopy(getattr(message,'entities',[]) or [])
+    linked=missing=0
+    kept=[]
+    for entity in rewritten:
+        name=type(entity).__name__
+        if name not in {'MessageEntityTextUrl','MessageEntityUrl'}:
+            kept.append(entity)
+            continue
+        start=_utf16_to_index(text,int(entity.offset)); end=_utf16_to_index(text,int(entity.offset+entity.length))
+        url=getattr(entity,'url',None) or text[start:end]
         parsed=parse_tme_message_url(url)
-        if not parsed: continue
-        source_id=int(parsed[1]); target_id=source_to_target.get(source_id)
-        out.append(html.escape(text[cursor:start]))
-        label=html.escape(text[start:end])
-        if target_id:
-            if target_username: dest=f'https://t.me/{target_username}/{target_id}'
-            else: dest=f'https://t.me/c/{str(target_channel_id).removeprefix("-100")}/{target_id}'
-            out.append(f'<a href="{html.escape(dest, quote=True)}">{label}</a>'); linked+=1
+        if not parsed:
+            kept.append(entity)
+            continue
+        target_id=source_to_target.get(int(parsed[1]))
+        if not target_id:
+            # Never leave an unresolved source-channel URL active in the target index.
+            missing+=1
+            continue
+        dest=target_message_url(target_channel_id,target_id,target_username)
+        if name=='MessageEntityTextUrl':
+            entity.url=dest
+            kept.append(entity)
         else:
-            out.append(label); missing+=1
-        cursor=end
-    out.append(html.escape(text[cursor:]))
-    return ''.join(out),linked,missing
+            # Convert visible-URL entities to hidden target links without shifting text.
+            try:
+                from telethon.tl.types import MessageEntityTextUrl
+                kept.append(MessageEntityTextUrl(offset=entity.offset,length=entity.length,url=dest))
+            except Exception:
+                missing+=1
+                continue
+        linked+=1
+    rewritten=kept
+    try:
+        from telethon.extensions import html as telethon_html
+        rendered=telethon_html.unparse(text,rewritten)
+    except Exception:
+        # Safe fallback retains text and clickable links, though formatting may be
+        # reduced on environments where Telethon's HTML extension is unavailable.
+        out=[]; cursor=0
+        for start,end,url in source_links(message):
+            parsed=parse_tme_message_url(url); target_id=source_to_target.get(int(parsed[1])) if parsed else None
+            out.append(html.escape(text[cursor:start])); label=html.escape(text[start:end])
+            if target_id:
+                dest=target_message_url(target_channel_id,target_id,target_username)
+                out.append(f'<a href="{html.escape(dest, quote=True)}">{label}</a>')
+            else:
+                out.append(label)
+            cursor=end
+        out.append(html.escape(text[cursor:])); rendered=''.join(out)
+    return rendered,linked,missing
+
+
+def normalize_index_text(value: str) -> str:
+    """Normalize harmless whitespace differences when validating copied indexes."""
+    return ' '.join(unicodedata.normalize('NFKC', value or '').split())
 
 
 def _message_filename(message) -> str:
@@ -103,7 +154,15 @@ def _pair_score(source, target, source_index: int, target_index: int, source_cou
     target_name = _message_filename(target)
     caption_score = _similarity(source_caption, target_caption)
     filename_score = _similarity(source_name, target_name)
-    content_score = max(caption_score, filename_score) if source_name and target_name else caption_score
+    if source_name and target_name and source_caption and target_caption:
+        # Require corroboration from both caption and filename. This prevents
+        # repeated generic captions (e.g. "Lecture 01") from overriding distinct
+        # filenames and producing a confident but incorrect one-to-one pairing.
+        content_score = 0.55 * filename_score + 0.45 * caption_score
+    elif source_name and target_name:
+        content_score = filename_score
+    else:
+        content_score = caption_score
     # Relative order is only a tie-breaker, not the primary matching criterion.
     sp = source_index / max(1, source_count - 1)
     tp = target_index / max(1, target_count - 1)
